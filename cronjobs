@@ -1,0 +1,5 @@
+# cronjob file for readynas-root
+# import into cronjob with: 'crontab /root/cronjobs'
+30 23 * * * /root/backup_scripts/critical_backup >/dev/null 2>&1
+30 1 * * 0 /root/backup_scripts/regular_backup >/dev/null 2>&1
+30 0 * * 3 /root/backup_scripts/offsite_backup >/dev/null 2>&1

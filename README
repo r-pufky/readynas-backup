@@ -1,0 +1,57 @@
+Copyright 2008, Robert Pufky (github.com/r-pufky)
+
+ReadyNAS Backup Scripts
+-----------------------
+These were a collection of scripts I wrote to overcome the restricted backup
+functionality provided by the backup web-face on the ReadyNAS.  Any questions or
+comments, please let me know!  More information, and updated versions can be
+found at:
+
+  http://www.crazymonkies.com/projects.php?type=readynas
+
+1) If you have never run cronjob tasks before, or not comfortable with using the
+   commandline, STOP NOW.  These scripts are fore more advanced users who want
+   more control over their backups.
+
+2) Read the scripts and the cronjob file and verify they are setup the way you
+   want them.  Please note the generation of public key authentication for the
+   NAS, and also note that as of this release, the ReadyNAS was affected by the
+   openssl bug.  If you don't want to use a script, you can just remove it from
+   the cronjobs file, and delete the script.
+   
+3) Prep the ReadyNAS for backup scripts:
+
+   - Install SSH Addons if they are not installed already.  They are located
+     here:
+
+       http://www.readynas.com/?page_id=93
+   
+     You want to select your current ReadyNAS firmware version, then download 
+     and install the following packages:
+   
+       ToggleSSH
+       EnableRootSSH
+   
+   - Create a backup share, only allowing READ access to normal users.  I named
+     my backup share "Backup"
+     
+4) Copy the script to the root directory on your NAS; the command would be
+   something like the following:
+   
+   scp -r ReadyNAS-Backup-Scripts/ root@YOURNAS:/root/
+
+5) SSH to your box to verify the setup.  I would recommend logging into your NAS
+   and verifying your scripts are working as intended by first running the
+   scripts with the --check and --log options:
+   
+     ./[script]_backup --check --log
+   
+   After that, run the initial backup with that script.  Please note that the
+   first actual backup of data will take the longest.  You should probably run 
+   the first backup with --log to make sure everything goes well:
+   
+     ./[script]_backup --log
+
+6) Install your cronjob, and go.
+
+   crontab /root/cronjobs

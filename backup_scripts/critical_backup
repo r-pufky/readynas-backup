@@ -1,0 +1,322 @@
+#!/usr/bin/perl -w
+#
+# Sync's critical data to user read-only directory on NAS.
+# Copyright 2008, Robert Pufky (github.com/r-pufky)
+# http://www.crazymonkies.com/projects.php?type=readynas
+#
+# Installation / Usage:
+# ---------------------
+# run './critical_backup --help' for more information
+#
+# Recommended cronjob:
+#     30 23 * * * /root/backup_scripts/critical_backup
+#
+# Notes:
+#   This is meant to be run on very small critical pieces of data, which will be
+#   backed up very fast.  If you want to backup larger sets of data, use the
+#   regular_backup script, which can be run in a separate cronjob.  Remote data
+#   is backed up VIA rsync over SSH.
+#
+#   The rsync over SSH setup that is used in this script requires public-key
+#   authentication, which a basic setup is described below.  Google for more
+#   information.
+#
+#   This job should run relatively quickly after the initial sync, as critical
+#   data shouldn't change that much.  Should be run relatively frequently.
+#
+#   If NO directories are being backed up locally or remotely, just leave the
+#   directory list blank.  It should look like:
+#   - local NAS directories:  $NAS{'LOCAL'} = [];
+#   - remote directories:     $NAS{'REMOTE'} = [];
+#
+#   Initially, this should be run manually with logging enabled to make sure you
+#   are grabbing everything that you want.  The initial sync will take the
+#   longest, and it's best to monitor the first sync to adjust your backups
+#   accordingly.
+#
+#     ./critical_backup --log
+#
+# Public-key Setup:
+# - Setup local (NAS) .ssh directory
+#     ssh root@YOURNAS
+#     mkdir -p ${HOME}/.ssh
+#     chmod 0700 ${HOME}/.ssh
+#   - Generate a passwordless DSA public/private keyset **
+#       ssh-keygen -t dsa -f ${HOME}/.ssh/id_dsa -P ''
+#   - Upload public key to your server VIA scp
+#       scp -P PORT ${HOME}/.ssh/id_dsa.pub USER@SERVER:/REMOTEHOME/
+# - Setup remote system directory
+#     ssh USER@HOST -p PORT
+#     mkdir -p ${HOME}/.ssh
+#     cat ${HOME}/id_dsa.pub >> ${HOME}/.ssh/authorized_keys
+#     cat ${HOME}/id_dsa.pub >> ${HOME}/.ssh/authorized_keys2
+#     chmod 0600 ${HOME}/.ssh/authorized_keys*
+#
+# ** At the time of this script, there was an openssl bug that affected the
+#    ReadyNAS, which created cryptographically weak keys.  The work-around is
+#    to generate the keys on a Mac or linux box that isn't affected by the keys
+#    using the folloing command, then copy the resulting (id_dsa,id_dsa.pub)
+#    keys to your ReadNAS:
+#
+#      ssh-keygen -t dsa -f ~/id_dsa -C 'root@YOURNAS' -P ''
+#      scp -P PORT ~/id_dsa* root@YOURNAS:/root/.ssh/
+#
+use strict;
+my %NAS;
+# -----------------------------------------------------------------------------
+# Critical local NAS directories to backup
+$NAS{'LOCAL'} = [
+    '/me_home/Pastor/',
+    '/me_home/Documents'];
+# Critical remote system directories to backup
+$NAS{'REMOTE'} = [
+    '/Users/me/Library/Keychains/', 
+    '/Users/me/Library/Calendars',
+    '/Users/me/Library/iTunes',
+    '/Users/me/Library/Application Support/AddressBook',
+    '/Users/me/Library/Application Support/Little Snitch'];
+# Local NAS destination backup directory, should be from root of drive
+$NAS{'DESTINATION'} = '/Backup/Critical/';
+# remote system to connect to
+$NAS{'HOST'} = '192.168.0.10';
+# remote user to authenticate with
+$NAS{'USER'} = 'me';
+# remote port for SSH server
+$NAS{'PORT'} = '22';
+# E-mail message settings
+$NAS{'TO'} = 'readynas@example.com';
+$NAS{'FROM'} = 'readynas@example.com';
+# rsync binary location (run 'which rsync' from the command line to find it)
+$NAS{'RSYNC'} = '/usr/bin/rsync';
+# -----------------------------------------------------------------------------
+
+
+
+my $start_time = time();
+my $check = 0;
+my $escape_spaces = 1;
+my $log = 0;
+foreach(@ARGV) {
+  if( $_ eq '--check' ) { $check = 1; }
+  if( $_ eq '--log' ) { $log = 1; }
+  if( $_ eq '--no-space-escape' ) { $escape_spaces = 0; }
+  if( $_ eq '--help' or $_ eq '-h' ) { usage(); exit(0); }
+}
+%NAS = clean_options(\%NAS, $check, $escape_spaces, $log);
+if( !-d $NAS{'DESTINATION'} && !-w $NAS{'DESTINATION'} ) {
+  my $error = 'Local NAS directory '.$NAS{'DESTINATION'}.' not found, not a '.
+              'directory or not writable by this program!';
+  if( $check ) { print "\n".$error."\n";}
+  send_mail($NAS{'TO'},$NAS{'FROM'},"Critical backup FAILED.",$error);
+} else {
+  send_mail($NAS{'TO'},$NAS{'FROM'},"Starting backup of critical data...",
+            "All options verified,\n\nStarting critical backup now...");
+  %NAS = backup(\%NAS, $check);
+  my $body = "Successful backups:\n-------------------\n" . 
+             join("\n",@{$NAS{'successes'}});
+  if( scalar(@{$NAS{'failures'}}) == 0 ) {
+    $body .= "\n\nThere were no failed backup jobs.";
+  } else {
+    $body .= "\n\nFailed backups:\n---------------\n" . 
+             join("\n",@{$NAS{'failures'}});
+  }
+  my ($secs,$mins,$hours) = gmtime(time() - $start_time);
+  $body .= "\n\nJob completed in ".$hours." hours, ".
+           $mins." minutes, ".$secs." seconds.";  
+  if( scalar(@{$NAS{'failures'}}) == 0 ) {
+    send_mail($NAS{'TO'},$NAS{'FROM'},"Critical backup success!!",$body);
+  } else {
+    send_mail($NAS{'TO'},$NAS{'FROM'},"Critical backup FAILED.",$body);
+  }
+}
+
+# Function: clean_options
+# Purpose:  cleans initial options and sets additional key options:
+#           RSYNC_OPTIONS, RSYNC_REMOTE_OPTIONS, failures, successes
+# Requires: NAS           - a hash reference containing the configuration keys
+#           check         - boolean, True to run rsync in dry-run mode
+#           escape_spaces - boolean, True to escape destination string
+#           log           - boolean, True to ryn rsync in verbose mode
+# Returns:  A NAS hash with new and cleaned keys
+sub clean_options {
+  # grab the NAS reference, and create a nice hash pointer to the NAS data
+  my($NAS_reference, $check, $escape_spaces, $log) = @_;
+  my %NAS = %{$NAS_reference};
+  
+  $NAS{'RSYNC_OPTIONS'} = 
+      '--size-only --copy-unsafe-links --archive --delete';
+  if( $check ) { $NAS{'RSYNC_OPTIONS'} .= ' --dry-run'; }
+  if( $log ) { $NAS{'RSYNC_OPTIONS'} .= ' --verbose'; }
+  
+  # ensure trailing / on destination directory
+  $NAS{'DESTINATION'} =~ s/(.*)([^\/]$)/$1$2\//;
+
+  # remove trailing / on local directories, ensure no duplicate 'source' dirs
+  foreach(@{$NAS{'LOCAL'}}) { $_ =~ s/\/$//; }
+  check_duplicates(\@{$NAS{'LOCAL'}});
+
+  # remote trailing /, escape spaces if specified, ensure no duplicate 'remote'
+  # directories
+  foreach(@{$NAS{'REMOTE'}}) {
+    if( $escape_spaces ) { $_ =~ s/ /\\ /g; }
+    $_ =~ s/\/$//;
+  }
+  check_duplicates(\@{$NAS{'REMOTE'}});
+
+  $NAS{'RSYNC_REMOTE_OPTIONS'} = 
+      '--rsh="ssh -p '.$NAS{'PORT'}.'" '.$NAS{'USER'}.'@'.$NAS{'HOST'}.':';
+  $NAS{'failures'} = [];
+  $NAS{'successes'} = [];
+  
+  if( $check ) {
+    print "\nCleaned options:\n----------------\n";
+    print "Local backup directories:\n";
+    print join("\n",@{$NAS{'LOCAL'}});
+    print "\n\nRemote backup directories:\n";
+    print join("\n",@{$NAS{'REMOTE'}});
+    print "\n\nEscape spaces in remote directories?: ";
+    if( $escape_spaces == 1 ) {
+      print "YES\n";
+    } else { 
+      print "NO\n";
+    }
+    print "NAS destination directory: " . $NAS{'DESTINATION'} . "\n";
+    print "Remote host: " . $NAS{'HOST'} . "\n";
+    print "Remote user: " . $NAS{'USER'} . "\n";
+    print "Remote port: " . $NAS{'PORT'} . "\n";
+    print "To address: " . $NAS{'TO'} . "\n";
+    print "From address: " . $NAS{'FROM'} . "\n";
+    print "Rsync binary location: " . $NAS{'RSYNC'} . "\n";
+    print "Rsync options to use: " . $NAS{'RSYNC_OPTIONS'} . "\n";
+    print "Rsync remote options to use: " . $NAS{'RSYNC_REMOTE_OPTIONS'} . 
+        "\n\n";
+    print "Simulating backup with dry rsync run:\n";
+  }
+  return %NAS;
+}
+
+# Function: send_mail
+# Purpose:  sends a mail VIA sendmail with given content
+# Requires: to      - string To e-mail address
+#           from    - string From e-mail address
+#           subject - string subject
+#           body    - string e-mail body
+sub send_mail {
+  my ($to, $from, $subject, $body) = @_;
+  my $sendmail = "/usr/sbin/sendmail -t";
+  open(SENDMAIL, "|$sendmail") or return 0;
+  print SENDMAIL "To: $to\n";
+  print SENDMAIL "From: $from\n";
+  print SENDMAIL "Subject: $subject\n";
+  print SENDMAIL "Content-type: text/plain\n\n"; 
+  print SENDMAIL "$body\n"; 
+  close(SENDMAIL);
+}
+
+# Function: backup
+# Purpose:  rsyncs the given NAS local and remote source directories to 
+#           destination directories
+# Requires: NAS - a hash reference containing the configuration keys, must be
+#                 run through clean_options first
+# Returns:  True on success, False on non-writable or non-directory destination
+# Returns:  A NAS hash with processed successes and failures.
+sub backup {
+  # grab the NAS reference, and create a nice hash pointer to the NAS data
+  my($NAS_reference, $check) = @_;
+  my $NAS = %{$NAS_reference};
+
+  my $rsync_command = '';
+  foreach(@{$NAS{'LOCAL'}}) {
+    $rsync_command = $NAS{'RSYNC'}." ".
+                     $NAS{'RSYNC_OPTIONS'}." '".$_.
+                     "' '".$NAS{'DESTINATION'}."'";
+    if( $check ) { print $rsync_command . "\n"; }
+    if( system($rsync_command) != 0 ) {
+      push(@{$NAS{'failures'}},$_);
+    } else {
+      push(@{$NAS{'successes'}},$_);
+    }
+  }
+  foreach(@{$NAS{'REMOTE'}}) {
+    $rsync_command = $NAS{'RSYNC'}." ".
+                     $NAS{'RSYNC_OPTIONS'}." ".
+                     $NAS{'RSYNC_REMOTE_OPTIONS'}."'".$_.
+                     "' '".$NAS{'DESTINATION'}."'";
+    if( $check ) { print $rsync_command . "\n"; }
+    if( system($rsync_command) != 0 ) {
+      push(@{$NAS{'failures'}},$_);
+    } else {
+      push(@{$NAS{'successes'}},$_);
+    }
+  }
+  return %NAS;
+}
+
+# Function: check_duplicates
+# Purpose:  checks for duplicate source directories in a given array
+# Requires: array - a array reference containing the directories to check
+# Returns:  True on success, exits with e-mail and error(1) if failed
+sub check_duplicates {
+  my($directories_reference) = @_;
+  my @check_directories = @{$directories_reference};
+  my %duplicate_counter;
+  my $last_dir_name;
+
+  foreach(@check_directories) {
+    # grab the last directory in the source string, and lowercase it to compare
+    $last_dir_name = (split(/\//, $_))[-1];
+    $last_dir_name =~ tr/[A-Z]/[a-z]/;
+    $duplicate_counter{$last_dir_name}++;
+    if( $duplicate_counter{$last_dir_name} > 1 ) {
+      my $body = "Your source directories have the same LAST directory name.  ".
+          "This WILL LEAD TO DATA LOSS, as only the last duplicate directory ".
+          "is copied to the destination (not the full path).  This will ".
+          "overwrite the first directory backed up on the remote server.\n\n".
+          "ABORTING TO PRESERVE DATA.\n--------------------------\n";
+      $body .= join("\n",@check_directories);
+      send_mail($NAS{'TO'},$NAS{'FROM'},
+                "Critical backup ABORTED - duplicate sources detected!",$body);
+      exit(1);
+    }
+  }
+  return 1;
+}
+
+# Function: usage
+# Purpose:  prints usage information, and exits with no error
+# Requires: none
+sub usage {
+  print "
+  critical_backup <OPTIONS>
+
+  This will sync critical backup data (from the NAS and/or a remote system) to a
+  directory on NAS (preferably read-only by normal users).  By default, this 
+  program runs sliently.  Edit the script to add/change directories that are 
+  backed up.
+  
+  OPTIONS:
+
+  --check             Turns on checking mode, showing processed options before
+                      execution, and DISABLES actual rsync transfers.  This is
+                      useful to test that everything is setup correctly before
+                      running the script.
+  
+  --log               Logs rync status, and transfer details to the terminal
+                      window.  If run in a cronjob, you should redirect this
+                      output to a logfile somewhere.  Useful for debugging, and
+                      verifying copied files.
+                      
+  --no-space-escape   By default, remote directories are quoted and escaped.
+                      However, some systems only handle quoting or escaping, but
+                      not both.  Enable this flag if your remote directories 
+                      have spaces in them, and FAIL for no apparent reason.  
+                      This is most easily determined by running this program 
+                      with the --check option, and looking for (code 23) errors 
+                      during the rsync transfers.  If you see those, setting 
+                      this option should fix those errors and allow transfers on
+                      remote servers.
+                      
+  --help / -h         This help message.
+  ";
+  exit(0);
+}
